@@ -31,6 +31,33 @@ Upstream, every remote reload of an offloaded object is copied into a staging bu
 - **NIC selection:** the arena is registered under the device's NUMA node from sysfs, so the Transfer Engine picks the NICs closest to the memory. A CXL expander uses its host socket's NICs.
 - **Metrics:** `mooncake_ssd_zero_copy_ops_total`, `mooncake_ssd_zero_copy_bytes_total` and `mooncake_ssd_zero_copy_fallbacks_total`.
 
+### Performance
+
+Zero-copy removes the owning server's per-byte work from every remote reload:
+
+| Per reloaded byte, on the owning server | Copy path (upstream) | Zero-copy (this fork) |
+|---|---|---|
+| CPU `memcpy` | Every byte, copied serially | None; only a header and key check per record |
+| Memory passes | 3: read PMem/CXL, write the DRAM staging buffer, NIC reads staging | 1: NIC reads PMem/CXL |
+| Staging memory | `ClientBuffer`, held until release or lease expiry | None; the extent is pinned in place |
+| Reload RPC returns | After every byte is copied | As soon as the records are pinned |
+
+**Reload latency.** On the copy path the server finishes copying before the reader can start its transfer, so the two times add. Zero-copy removes the copy entirely. For large batches, the saving depends on how fast the server copies compared with the link:
+
+| Server copy rate vs link | Reload time | Speed-up |
+|---|---|---|
+| Copy 2× faster than the link | −33% | 1.5× |
+| Copy as fast as the link | −50% | 2× |
+| Copy at half the link speed | −67% | 3× |
+
+A single-core copy out of PMem or CXL memory is usually slower than a 200 Gb/s link (25 GB/s), so the copy tends to dominate reload time.
+
+**Many readers.** On the copy path, total reload bandwidth is bounded by the server's copy threads and three memory passes per byte. With zero-copy it is bounded by the NIC and the media's read bandwidth. Server CPU per batch scales with the number of keys, not bytes, which matters most when one memory server feeds many clients.
+
+**In-flight capacity.** Pinned reloads don't use the staging buffer, which stays free for the copy fallback. That roughly doubles the reload data that can be in flight before requests are refused.
+
+**Unchanged:** network transfer time, the media's read bandwidth (the NIC still reads PMem/CXL), the offload (write) path, and SSD or file-based arenas.
+
 ### Configuration
 
 Set these on the server that owns the arena, alongside the usual offload settings: `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`, `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES`, and the offset-allocator backend.
