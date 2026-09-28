@@ -1,3 +1,57 @@
+# Mooncake-Optane
+
+This fork of [kvcache-ai/Mooncake](https://github.com/kvcache-ai/Mooncake) lets Mooncake Store keep offloaded KV cache on **Intel Optane PMem and CXL-attached memory**. Remote clients read it back **zero-copy over RDMA**. The target deployment is a shared, networked KV cache: one memory server serving many inference clients, such as a group of NVIDIA DGX Sparks.
+
+Upstream pull requests:
+- [kvcache-ai/Mooncake#3958](https://github.com/kvcache-ai/Mooncake/pull/3958): device-DAX arena for the offset-allocator offload backend.
+- [kvcache-ai/Mooncake#4357](https://github.com/kvcache-ai/Mooncake/pull/4357): zero-copy RDMA reads from the DAX arena. Stacked on #3958.
+
+## What this fork adds
+
+### Optane PMem / CXL memory as the offload tier
+
+`OffsetAllocatorStorageBackend` can put its data arena on byte-addressable memory instead of a file on SSD:
+- **Supported targets:** a device-DAX character device (`/dev/daxX.Y`, backed by Optane PMem or a CXL memory expander), an fsdax file, or any regular file.
+- **I/O:** the arena is mapped once with `mmap(MAP_SHARED)` and records are copied with `memcpy`. There are no syscalls on the data path, which device-DAX requires anyway.
+- **Unchanged:** the allocator, sharded index, watermark eviction and checkpoint format.
+- **Restarts:** device memory outlives the process, so `MOONCAKE_OFFSET_PERSIST_MODE=strict` or `relaxed` restores the arena after a restart.
+- **Power-fail durability:** optional on persistent memory without eADR. `MOONCAKE_OFFSET_DAX_FLUSH_CPU_CACHE` writes each record's cache lines back (CLWB, else CLFLUSHOPT, else CLFLUSH, then SFENCE) before the write returns. This is x86-64 only.
+- **Safety:** an exclusive `flock` stops a second client from sharing a device. The backend refuses to start if the device is the same one the Transfer Engine uses for its `cxl` protocol (`MC_CXL_DEV_PATH`).
+- **Capacity:** rounded down to the device alignment, since device-DAX rejects unaligned mappings.
+
+### Zero-copy RDMA reads
+
+Upstream, every remote reload of an offloaded object is copied into a staging buffer on the owning server (`ClientBuffer`) before the reader can fetch it. With `MOONCAKE_OFFSET_DAX_ZERO_COPY=1`:
+- **Registration:** the whole DAX mapping is registered with the Transfer Engine at startup.
+- **Pinning:** `BatchGet` pins the requested records in place and returns their addresses inside the mapping. The reader's NIC reads the values straight out of PMem/CXL.
+- **Server cost:** no `memcpy` and no staging memory on the server. The RPC returns as soon as the records are pinned, not after every byte is copied. Memory traffic drops from three passes per byte to one.
+- **Lifetime:** pinned extents stay allocated until the reader releases the batch or its lease expires, even if the key is evicted or overwritten meanwhile.
+- **Limit and fallback:** pins are capped at `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES`. Over the cap, or if registration fails, reads fall back to the copy path automatically.
+- **Compatibility:** the wire protocol is unchanged, so readers need no changes.
+- **NIC selection:** the arena is registered under the device's NUMA node from sysfs, so the Transfer Engine picks the NICs closest to the memory. A CXL expander uses its host socket's NICs.
+- **Metrics:** `mooncake_ssd_zero_copy_ops_total`, `mooncake_ssd_zero_copy_bytes_total` and `mooncake_ssd_zero_copy_fallbacks_total`.
+
+### Configuration
+
+Set these on the server that owns the arena, alongside the usual offload settings: `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`, `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES`, and the offset-allocator backend.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MOONCAKE_OFFSET_DAX_DEVICE_PATH` | unset | Device or file to map as the data arena. Unset keeps the file-based arena. |
+| `MOONCAKE_OFFSET_DAX_ALIGNMENT_BYTES` | `2097152` | Capacity is rounded down to a multiple of this (2 MiB, or 1 GiB for some namespaces). |
+| `MOONCAKE_OFFSET_DAX_FLUSH_CPU_CACHE` | `false` | Flush CPU caches on every write, for power-fail durability on PMem without eADR. x86-64 only. |
+| `MOONCAKE_OFFSET_DAX_ZERO_COPY` | `false` | Serve remote reads straight out of the mapping over RDMA. |
+| `MOONCAKE_OFFSET_DAX_NUMA_NODE` | `-1` (auto) | NUMA node to register the arena under. Auto reads the device's `numa_node` from sysfs. |
+
+On the reading clients:
+- Keep the Transfer Engine on the RDMA NICs that reach the server (`MC_TE_FILTERS`).
+- Match the fabric's RoCEv2 settings (`MC_GID_INDEX`, `MC_MTU`, `MC_IB_TC`/`MC_IB_SL`).
+- Set `MC_TE_METADATA_REFRESH_INTERVAL_SECONDS` so readers pick up the arena's new registration after a server restart.
+
+Full details: [SSD offload deployment guide](docs/source/deployment/ssd/ssd-offload.md#device-dax--cxl-memory-arena) and the [SSD offload design](docs/source/design/store/ssd-offload.md).
+
+---
+
 <div align="center">
   <img src=image/mooncake-icon.png width=44% />
   <h2 align="center">
