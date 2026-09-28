@@ -12,7 +12,7 @@ Upstream pull requests:
 
 `OffsetAllocatorStorageBackend` can put its data arena on byte-addressable memory instead of a file on SSD:
 - **Supported targets:** a device-DAX character device (`/dev/daxX.Y`, backed by Optane PMem or a CXL memory expander), an fsdax file, or any regular file.
-- **I/O:** the arena is mapped once with `mmap(MAP_SHARED)` and records are copied with `memcpy`. There are no syscalls on the data path, which device-DAX requires anyway.
+- **I/O:** the arena is mapped once with `mmap(MAP_SHARED)`, so there are no syscalls on the data path, which device-DAX requires anyway. On x86-64, record segments of 256 B or more are written with non-temporal stores; smaller ones use `memcpy`.
 - **Unchanged:** the allocator, sharded index, watermark eviction and checkpoint format.
 - **Restarts:** device memory outlives the process, so `MOONCAKE_OFFSET_PERSIST_MODE=strict` or `relaxed` restores the arena after a restart.
 - **Power-fail durability:** optional on persistent memory without eADR. `MOONCAKE_OFFSET_DAX_FLUSH_CPU_CACHE` writes each record's cache lines back (CLWB, else CLFLUSHOPT, else CLFLUSH, then SFENCE) before the write returns. This is x86-64 only.
@@ -33,7 +33,24 @@ Upstream, every remote reload of an offloaded object is copied into a staging bu
 
 ### Performance
 
-Zero-copy removes the owning server's per-byte work from every remote reload:
+**Why PMem or CXL memory.** A KV cache hit saves recomputing the prefill for that prefix. So the offload tier should be as large as possible, and still fast enough that reloading beats recomputing. Byte-addressable memory sits between DRAM and SSD:
+
+| | DRAM | Optane PMem | CXL memory | NVMe SSD |
+|---|---|---|---|---|
+| Capacity | Limited by DIMM slots and cost | 128–512 GB per module, alongside DRAM | Expanders add memory beyond the DIMM slots | Largest |
+| Access | Load/store | Load/store | Load/store | 4 KiB blocks through the kernel |
+| Read latency | ~100 ns | ~300 ns | A few hundred ns | Tens of µs |
+| NIC reads it directly | Yes | Yes, so zero-copy | Yes, so zero-copy | No; needs a DRAM staging copy |
+| Survives a process restart | No | Yes | Yes | Yes |
+| Survives power loss | No | Yes (eADR, or `MOONCAKE_OFFSET_DAX_FLUSH_CPU_CACHE`) | No | Yes |
+
+What that means for a shared KV cache:
+- **More cache per server.** A PMem or CXL arena holds far more KV cache than DRAM for the same budget, so more requests hit instead of recomputing prefill. DRAM stays free for Mooncake's hot tier.
+- **Reloads stay memory-speed.** Values are read at memory latency with no block I/O and no 4 KiB rounding. With zero-copy, the reader's NIC reads them directly from the arena.
+- **Warm restarts.** The arena outlives the process, and on PMem also a power loss. With `MOONCAKE_OFFSET_PERSIST_MODE=strict` or `relaxed`, a restarted server comes back with its cache instead of an empty one.
+- **Trade-offs.** Optane writes much more slowly than it reads. See **Offload writes** below. Intel has discontinued Optane, and CXL memory is its successor on newer servers. Both use the same `/dev/daxX.Y` path, so this code works with either.
+
+**Zero-copy reloads.** Zero-copy removes the owning server's per-byte work from every remote reload:
 
 | Per reloaded byte, on the owning server | Copy path (upstream) | Zero-copy (this fork) |
 |---|---|---|
@@ -56,7 +73,9 @@ A single-core copy out of PMem or CXL memory is usually slower than a 200 Gb/s l
 
 **In-flight capacity.** Pinned reloads don't use the staging buffer, which stays free for the copy fallback. That roughly doubles the reload data that can be in flight before requests are refused.
 
-**Unchanged:** network transfer time, the media's read bandwidth (the NIC still reads PMem/CXL), the offload (write) path, and SSD or file-based arenas.
+**Offload writes.** A normal `memcpy` into the arena first reads every destination cache line from the media, then writes it back in 64 B pieces. Optane's internal write unit is 256 B, so that means an extra media read plus partial writes. On x86-64, record segments of 256 B or more therefore use non-temporal stores, which skip the cache and give Optane its highest write bandwidth ([Yang et al., FAST '20](https://www.usenix.org/system/files/fast20-yang.pdf)). A fence orders them before the metadata that publishes the record. This has not been benchmarked on hardware yet.
+
+**Unchanged:** network transfer time, the media's read bandwidth (the NIC still reads PMem/CXL), and SSD or file-based arenas.
 
 ### Configuration
 
