@@ -15,6 +15,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ARG PYTHON_VERSION=3.10
 ARG PYPA_INDEX_URL=https://bootstrap.pypa.io
 ARG CMAKE_BUILD_TYPE=Release
+ARG BUILD_JOBS=4
 ARG EP_TORCH_VERSIONS="2.14.0"
 ARG TORCH_CUDA_ARCH_LIST=""
 # CI can opt in to removing /workspace/build from the builder layer.
@@ -57,7 +58,7 @@ RUN bash dependencies.sh -y
 # therefore not retained in the builder image or BuildKit cache.
 RUN mkdir -p build && \
     cd build && \
-    cmake -G Ninja .. \
+    cmake -G Ninja .. -DPARALLEL_COMPILE_JOBS=${BUILD_JOBS:-4} \
         -DBUILD_UNIT_TESTS=OFF \
         -DUSE_HTTP=ON \
         -DUSE_ETCD=ON \
