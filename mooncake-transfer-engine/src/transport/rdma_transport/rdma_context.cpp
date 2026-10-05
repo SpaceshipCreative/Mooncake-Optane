@@ -1592,13 +1592,17 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
                             << device_name;
                         goto cleanup_context_and_devices;
                     }
+                    // Keep the RNIC: host memory still registers through plain
+                    // ibv_reg_mr(), and only this GPU's buffers fail to
+                    // register. DGX Spark (GB10) has no GPUDirect RDMA and
+                    // NVIDIA's guidance there is RDMA from cudaHostAlloc().
                     if (!dmaBufSupported) {
-                        LOG(ERROR)
-                            << "DMA BUF supported required for GPU RDMA "
-                               "without "
-                               "nvidia-peermem on GPU device "
-                            << gpu_device << " mapped to RNIC " << device_name;
-                        goto cleanup_context_and_devices;
+                        LOG(WARNING)
+                            << "GPU device " << gpu_device << " mapped to RNIC "
+                            << device_name
+                            << " has no DMA-BUF support and nvidia-peermem "
+                               "is disabled: its memory cannot be registered "
+                               "for RDMA; host memory still can";
                     }
                 }
             }
