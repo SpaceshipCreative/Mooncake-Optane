@@ -506,31 +506,26 @@ int RdmaContext::deconstruct() {
     return 0;
 }
 
-// Whether the CUDA device backing `addr` supports dma-buf export. Unified-
-// memory SoCs (e.g. NVIDIA GB10) report CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED
-// == 0: their "device" memory is host DRAM and must take the host
-// registration path (ibv_reg_mr) rather than a dmabuf export. A failed query
-// returns true so discrete-GPU behavior is unchanged.
-static bool cudaDeviceDmabufSupported(CUdeviceptr addr) {
 #if defined(USE_CUDA) || defined(USE_SUPA)
+// Whether the device that owns `addr` can export dma-bufs. Only called after
+// cuPointerGetAttribute classified `addr` as device memory, so the driver is
+// initialized (cuInit is process-wide), and cuDeviceGet/cuDeviceGetAttribute
+// need no current context. A failed query returns true so the caller keeps
+// the regular dma-buf path and its error reporting.
+static bool cudaDeviceDmabufSupported(CUdeviceptr addr) {
     unsigned int devOrd = 0;
-    CUresult r = cuPointerGetAttribute(&devOrd,
-                                       CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
-                                       addr);
-    if (r != CUDA_SUCCESS) return true;
     CUdevice cuDevice;
-    if (cuDeviceGet(&cuDevice, (int)devOrd) != CUDA_SUCCESS) return true;
     int supported = 1;
-    if (cuDeviceGetAttribute(&supported,
-                             CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED,
-                             cuDevice) != CUDA_SUCCESS)
+    if (cuPointerGetAttribute(&devOrd, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                              addr) != CUDA_SUCCESS ||
+        cuDeviceGet(&cuDevice, (int)devOrd) != CUDA_SUCCESS ||
+        cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED,
+                             cuDevice) != CUDA_SUCCESS) {
         return true;
+    }
     return supported != 0;
-#else
-    (void)addr;
-    return true;
-#endif
 }
+#endif
 
 int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
     out = DmabufExport{};
@@ -557,23 +552,24 @@ int RdmaContext::exportDmabuf(void *addr, size_t length, DmabufExport &out) {
 
     if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
         out.method = DmabufExport::Method::kHostReg;
-    } else if (memType == CU_MEMORYTYPE_DEVICE &&
-               !Environ::Get().GetWithNvidiaPeermem() &&
-               !cudaDeviceDmabufSupported((CUdeviceptr)addr)) {
-        // Unified-memory SoCs (e.g. GB10): device memory is host DRAM and the
-        // device reports no dma-buf support. Registering it through the host
-        // path (ibv_reg_mr) is correct — the NIC can DMA straight from those
-        // pages — while a dmabuf export would fail or silently misbehave.
-        LOG(WARNING)
-            << "CUDA device memory at " << (uintptr_t)addr
-            << " on a device without dma-buf support (unified-memory SoC); "
-               "registering via host ibv_reg_mr path";
-        out.method = DmabufExport::Method::kHostReg;
+#if defined(USE_CUDA) || defined(USE_SUPA)
     } else if (memType == CU_MEMORYTYPE_DEVICE &&
                Environ::Get().GetWithNvidiaPeermem() && !data_direct) {
         // WITH_NVIDIA_PEERMEM env var is set: use ibv_reg_mr() directly for
         // GPU memory (requires the nvidia-peermem kernel module to be loaded).
         out.method = DmabufExport::Method::kHostReg;
+    } else if (memType == CU_MEMORYTYPE_DEVICE &&
+               !cudaDeviceDmabufSupported((CUdeviceptr)addr)) {
+        // Neither nvidia-peermem nor dma-buf: the NIC cannot reach this
+        // memory. On unified-memory SoCs such as NVIDIA GB10, cudaMalloc
+        // memory is not coherent for PCIe devices either, so a plain
+        // ibv_reg_mr() would not be safe. Host buffers still register.
+        LOG(ERROR) << "Cannot register GPU memory at " << addr
+                   << " for RDMA: the device supports neither nvidia-peermem "
+                      "nor dma-buf (e.g. NVIDIA GB10). Use host memory or "
+                      "the TCP transport for GPU buffers";
+        return ERR_CONTEXT;
+#endif
     } else if (memType == CU_MEMORYTYPE_DEVICE) {
 #if defined(USE_CUDA) || defined(USE_SUPA)
         // Ensure a CUDA context is current — worker threads or callers
@@ -1620,20 +1616,15 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
                         goto cleanup_context_and_devices;
                     }
                     if (!dmaBufSupported) {
-                        // Unified-memory SoCs (e.g. NVIDIA GB10 in DGX Spark)
-                        // expose device memory backed by host DRAM and report
-                        // no dma-buf support, but RDMA to remote hosts works
-                        // through plain host registration (ibv_reg_mr): the
-                        // pages are physically in host memory. Downgrade the
-                        // hard failure to a warning and let
-                        // registerMemoryRouteInternal route CU_MEMORYTYPE_DEVICE
-                        // buffers to the host-registration path.
+                        // Without nvidia-peermem or dma-buf the RNIC cannot
+                        // reach GPU memory, but host memory still works (e.g.
+                        // NVIDIA GB10, which supports neither). Keep the RNIC;
+                        // exportDmabuf() rejects GPU buffers individually.
                         LOG(WARNING)
-                            << "GPU device " << gpu_device
-                            << " mapped to RNIC " << device_name
-                            << " reports no dma-buf support (unified-memory "
-                               "SoC?); GPU buffers will use host ibv_reg_mr "
-                               "registration";
+                            << "GPU device " << gpu_device << " mapped to RNIC "
+                            << device_name
+                            << " supports neither nvidia-peermem nor dma-buf; "
+                               "RNIC enabled for host memory only";
                     }
                 }
             }
