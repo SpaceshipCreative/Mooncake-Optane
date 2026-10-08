@@ -1136,8 +1136,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     if (user_specified_port) {
         // User specified port, no retry needed
         this->local_hostname = local_hostname;
-        this->local_rpc_addr = buildHostNameWithPort(
-            getHostNameWithoutPort(hostname), local_rpc_port);
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, resolved_metadata_server, protocol,
             device_name, resolved_master_server_addr, transfer_engine,
@@ -1167,8 +1165,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
 
             this->local_hostname = buildHostNameWithPort(hostname, port);
-            this->local_rpc_addr =
-                buildHostNameWithPort(hostname, local_rpc_port);
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, resolved_metadata_server, protocol,
                 device_name, resolved_master_server_addr, transfer_engine,
@@ -1202,6 +1198,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                       "check MC_MS_AUTO_DISC and MC_FORCE_MNNVL";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+
+    // Remote readers of LOCAL_DISK replicas dial local_rpc_addr. Advertise the
+    // host the transfer engine publishes, not the raw local_hostname: without
+    // P2PHANDSHAKE the engine resolves a routable IP even when local_hostname
+    // is "localhost" or "0.0.0.0".
+    const std::string rpc_host =
+        getHostNameWithoutPort(client_->GetTransportEndpoint());
+    this->local_rpc_addr = buildHostNameWithPort(rpc_host, local_rpc_port);
 
     // Local_buffer_size is allowed to be 0, but we only register memory when
     // local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB, and may
@@ -1599,9 +1603,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         offload_rpc_port_ = offload_rpc_server_->port();
         LOG(INFO) << "Offload RPC server started on port " << offload_rpc_port_;
 
-        // Build local_rpc_addr from hostname + auto-allocated port
-        this->local_rpc_addr = buildHostNameWithPort(
-            getHostNameWithoutPort(this->local_hostname), offload_rpc_port_);
+        // Build local_rpc_addr from rpc_host + auto-allocated port
+        this->local_rpc_addr =
+            buildHostNameWithPort(rpc_host, offload_rpc_port_);
     }
     const auto distributed_config = DistributedStorageConfig::FromEnvironment();
     const bool enable_kvcs = distributed_config.UsesKvcs();
