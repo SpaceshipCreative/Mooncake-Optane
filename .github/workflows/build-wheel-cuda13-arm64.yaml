@@ -1,0 +1,19 @@
+name: Build wheel (CUDA 13, arm64)
+
+# On-demand cp312 aarch64 build of mooncake-transfer-engine-cuda13 from any
+# ref, through the same reusable job the release workflows use. The wheel is
+# uploaded as the run artifact mooncake-wheel-cuda13-arm64-py312.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda13
+      architecture: arm64
+      python-versions: '["3.12"]'
+      artifact-prefix: mooncake-wheel-cuda13-arm64
+      # Local version label: sorts after the 0.3.13.post1 release and names
+      # the run that built it.
+      version-override: 0.3.13.post1+optane.${{ github.run_number }}
