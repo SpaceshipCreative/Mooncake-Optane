@@ -249,6 +249,57 @@ TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
     }
 }
 
+// Remote readers dial a LOCAL_DISK replica's transport_endpoint. Without
+// P2PHANDSHAKE the transfer engine advertises its own address whatever
+// local_hostname says, so the endpoint must use that host too: a store set up
+// with local_hostname "localhost" must not publish "localhost:<port>".
+TEST_F(RealClientTest, LocalDiskEndpointUsesTransferEngineHost) {
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    // Pin the address the transfer engine advertises so the expected host
+    // does not depend on the machine's interfaces.
+    ScopedEnvVar bind_address("MC_TCP_BIND_ADDRESS", "127.0.0.1");
+
+    char path[] = "/tmp/mooncake_ssd_endpoint_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_FALSE(master_.metadata_url().empty());
+    ASSERT_EQ(
+        py_client_->setup_real("localhost", master_.metadata_url(),
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    const std::string key = "local_disk_endpoint_host";
+    ASSERT_EQ(py_client_->put(key, std::vector<char>(4096, 'x')), 0);
+
+    std::string endpoint;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (endpoint.empty() && std::chrono::steady_clock::now() < deadline) {
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) {
+                endpoint =
+                    replica.get_local_disk_descriptor().transport_endpoint;
+            }
+        }
+        if (endpoint.empty())
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    ASSERT_FALSE(endpoint.empty()) << "no LOCAL_DISK replica appeared";
+    EXPECT_EQ(getHostNameWithoutPort(endpoint), "127.0.0.1")
+        << "LOCAL_DISK endpoint " << endpoint;
+}
+
 TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
     ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
     ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
