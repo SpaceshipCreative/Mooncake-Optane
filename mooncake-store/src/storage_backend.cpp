@@ -5840,6 +5840,23 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
 }
 
 void OffsetAllocatorStorageBackend::RemoveAll() {
+    // A DAX arena is not truncated, so with persistence on a restart would
+    // re-read every old record a checkpoint still lists. Overwrite each
+    // header with one recovery rejects (unknown flag bits). key_len stays 0
+    // so a read racing this outside the shard lock fails its value_len
+    // check without sizing a key buffer from it.
+    const bool invalidate = !cfg_.dax_device_path.empty() &&
+                            cfg_.persist_mode != OffsetPersistMode::kDisabled &&
+                            data_file_ != nullptr;
+    RecordHeader dead{};
+    dead.value_len = std::numeric_limits<uint32_t>::max();
+    dead.seq = std::numeric_limits<uint64_t>::max();
+    dead.flags = ~RecordHeader::kKnownFlags;
+    char dead_buf[RecordHeader::SIZE];
+    dead.WriteTo(dead_buf);
+    const iovec dead_iov = {dead_buf, sizeof(dead_buf)};
+    size_t invalidate_failures = 0;
+
     // Acquire exclusive locks on all shards to safely clear the maps and
     // reset counters. The single-arg SharedMutexLocker constructor takes
     // exclusive mode (see mutex.h), so map.clear() is safe. The shard locks
@@ -5851,7 +5868,20 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
     for (size_t i = 0; i < kNumShards; ++i) {
         shard_locks.emplace_back(
             std::make_unique<SharedMutexLocker>(&shards_[i].mutex));
+        if (invalidate) {
+            for (const auto& [_, entry] : shards_[i].map) {
+                if (!data_file_->vector_write(
+                        &dead_iov, 1, static_cast<off_t>(entry.offset))) {
+                    ++invalidate_failures;
+                }
+            }
+        }
         shards_[i].map.clear();
+    }
+    if (invalidate_failures > 0) {
+        LOG(WARNING) << "RemoveAll: failed to invalidate "
+                     << invalidate_failures
+                     << " records; those keys can return after a restart";
     }
     total_size_.store(0, std::memory_order_relaxed);
     total_keys_.store(0, std::memory_order_relaxed);
@@ -5861,8 +5891,10 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
     // Rebinding the shared_ptr drops our ref; any in-flight
     // BatchLoad/BatchStore that pinned the old data_file_ keeps it alive until
     // its I/O completes — no use-after-free.
-    // A DAX arena keeps its mapping: the allocator rebuild below already
-    // makes every old record unreachable, and there is nothing to truncate.
+    // A DAX arena keeps its mapping and its allocator: clearing the shard
+    // maps above already freed every extent except those pinned by in-flight
+    // zero-copy reads, which a rebuilt allocator would hand out again under
+    // the reader.
     if (!data_file_path_.empty() && cfg_.dax_device_path.empty()) {
         int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
 #ifdef USE_URING
@@ -5886,8 +5918,13 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
                          << data_file_path_;
         }
     }
-    if (capacity_ > 0) {
+    if (capacity_ > 0 && cfg_.dax_device_path.empty()) {
         allocator_ = offset_allocator::OffsetAllocator::create(0, capacity_);
+    }
+    // Have the next checkpoint record the emptied allocator, so a restart
+    // does not walk and log every invalidated record of the old one.
+    if (!cfg_.dax_device_path.empty()) {
+        metadata_dirty_.store(true, std::memory_order_relaxed);
     }
 
     LOG(INFO) << "OffsetAllocatorStorageBackend::RemoveAll: cleared all data";
