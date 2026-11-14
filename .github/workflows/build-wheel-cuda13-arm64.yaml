@@ -14,6 +14,6 @@ jobs:
       architecture: arm64
       python-versions: '["3.12"]'
       artifact-prefix: mooncake-wheel-cuda13-arm64
-      # Local version label: sorts after the 0.3.13.post1 release and names
-      # the run that built it.
-      version-override: 0.3.13.post1+optane.${{ github.run_number }}
+      # Local version label: sorts after the 0.3.14 release and names the run
+      # that built it.
+      version-override: 0.3.14+optane.${{ github.run_number }}

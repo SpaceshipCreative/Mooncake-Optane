@@ -55,23 +55,27 @@ Workaround for a store you can't rebuild yet: set its `local_hostname` to
   | 0.3.13.post1 | 0.3.13.post1 | MATCH | 0 bytes (client dials `localhost:<port>`, RPC_FAIL) |
   | main | main and 0.3.13.post1 | MATCH | MATCH |
 
-## 2. GB10 RDMA (commit 3fe3f433, reworked)
+## 2. GB10 RDMA (commit 0f1c89e5, reworked)
 
-3fe3f433 registered GB10 `cudaMalloc` memory with plain `ibv_reg_mr()`.
+0f1c89e5 registered GB10 `cudaMalloc` memory with plain `ibv_reg_mr()`.
 NVIDIA's DGX Spark documentation says GPUDirect RDMA is unsupported and that
 GPU memory is not coherent for PCIe devices such as the NIC. That registration
 would therefore succeed and serve stale data. The reworked version:
 
 - **Init:** keeps the RNIC open when the GPU supports neither nvidia-peermem
   nor dma-buf, with a warning that it is enabled for host memory only. This is
-  3fe3f433's behavior.
+  0f1c89e5's behavior.
 - **Registration:** GPU memory without peermem and without dma-buf fails with
   an explicit error ("Cannot register GPU memory … Use host memory or the TCP
   transport"). Host memory, including `cudaHostAlloc`, registers normally.
-- **Branch order:** the nvidia-peermem branch comes first and is unchanged. No
-  path that used to fail now registers silently.
+- **Branch order:** the nvidia-peermem branch comes first and is unchanged.
+  From v0.3.14 an unset `WITH_NVIDIA_PEERMEM` follows whether the
+  `nvidia_peermem` (or legacy `nv_peer_mem`) module is loaded, so a GB10
+  client that leaves it unset reaches the rejection. An explicit `1` still
+  takes the plain `ibv_reg_mr()` path. No path that used to fail now
+  registers silently.
 - **Build guards:** the helper and the new branch compile only under
-  `USE_CUDA`/`USE_SUPA`. This fixes the non-CUDA build break 3fe3f433
+  `USE_CUDA`/`USE_SUPA`. This fixes the non-CUDA build break 0f1c89e5
   introduced (`'CUdeviceptr' was not declared`), which affected MACA, MLU,
   HIP and plain builds.
 - **cuInit:** the dma-buf query runs only after `cuPointerGetAttribute`
@@ -86,7 +90,7 @@ would therefore succeed and serve stale data. The reworked version:
 
 | Variable | Value | Why |
 |---|---|---|
-| `WITH_NVIDIA_PEERMEM` | `0` | GB10 has no nvidia-peermem. With the default (`1`), GPU buffers take the plain `ibv_reg_mr()` path. |
+| `WITH_NVIDIA_PEERMEM` | `0` | GB10 has no nvidia-peermem. `0` selects the dma-buf path, which rejects GPU buffers, and logs the host-memory-only warning at init. From v0.3.14 unset does the same when the peermem module is not loaded. Never set `1` here: it forces the plain `ibv_reg_mr()` path. |
 | `MC_GID_INDEX` | `3` | RoCEv2/IPv4 GID. The legacy engine otherwise auto-selects. |
 | `MC_MTU` | `4096` | Path MTU, capped at the port's active MTU. |
 | `MC_TE_FILTERS` | `<rnic>[,<rnic>]` | Use only NICs that can reach the store. |
@@ -133,7 +137,7 @@ gh run download <run-id> --repo SpaceshipCreative/Mooncake-Optane -n mooncake-wh
 pip uninstall -y mooncake-transfer-engine-cuda13 mooncake-transfer-engine && pip install mooncake-wheel/*.whl
 ```
 
-The version is `0.3.13.post1+optane.<run number>`.
+The version is `0.3.14+optane.<run number>`.
 
 **On-cluster Docker fallback.** The final image installs the wheel and deletes
 it, so build the `builder` stage and copy `dist/` out of it. Keep
