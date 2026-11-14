@@ -26,7 +26,7 @@ Upstream, every remote reload of an offloaded object is copied into a staging bu
 - **Pinning:** `BatchGet` pins the requested records in place and returns their addresses inside the mapping. The reader's NIC reads the values straight out of PMem/CXL.
 - **Server cost:** no `memcpy` and no staging memory on the server. The RPC returns as soon as the records are pinned, not after every byte is copied. Memory traffic drops from three passes per byte to one.
 - **Lifetime:** pinned extents stay allocated until the reader releases the batch or its lease expires, even if the key is evicted or overwritten meanwhile.
-- **Limit and fallback:** pins are capped at `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES`. Over the cap, or if registration fails, reads fall back to the copy path automatically.
+- **Limit and fallback:** in-flight pinned reads are capped at `MOONCAKE_OFFSET_DAX_ZERO_COPY_PIN_LIMIT_BYTES` (default: the arena size), independent of the staging buffer. Over the cap, or if registration fails, reads fall back to the copy path automatically.
 - **Compatibility:** the wire protocol is unchanged, so readers need no changes.
 - **NIC selection:** the arena is registered under the device's NUMA node from sysfs, so the Transfer Engine picks the NICs closest to the memory. A CXL expander uses its host socket's NICs.
 - **Metrics:** `mooncake_ssd_zero_copy_ops_total`, `mooncake_ssd_zero_copy_bytes_total` and `mooncake_ssd_zero_copy_fallbacks_total`.
@@ -71,7 +71,7 @@ A single-core copy out of PMem or CXL memory is usually slower than a 200 Gb/s l
 
 **Many readers.** On the copy path, total reload bandwidth is bounded by the server's copy threads and three memory passes per byte. With zero-copy it is bounded by the NIC and the media's read bandwidth. Server CPU per batch scales with the number of keys, not bytes, which matters most when one memory server feeds many clients.
 
-**In-flight capacity.** Pinned reloads don't use the staging buffer, which stays free for the copy fallback. That roughly doubles the reload data that can be in flight before requests are refused.
+**In-flight capacity.** Pinned reloads don't use the staging buffer, which stays free for the copy fallback. The reload data that can be in flight is bounded by the pin limit (the arena size by default), not by the staging buffer's DRAM.
 
 **Offload writes.** A normal `memcpy` into the arena first reads every destination cache line from the media, then writes it back in 64 B pieces. Optane's internal write unit is 256 B, so that means an extra media read plus partial writes. On x86-64, record segments of 256 B or more therefore use non-temporal stores, which skip the cache and give Optane its highest write bandwidth ([Yang et al., FAST '20](https://www.usenix.org/system/files/fast20-yang.pdf)). A fence orders them before the metadata that publishes the record. This has not been benchmarked on hardware yet.
 
@@ -88,6 +88,7 @@ Set these on the server that owns the arena, alongside the usual offload setting
 | `MOONCAKE_OFFSET_DAX_FLUSH_CPU_CACHE` | `false` | Flush CPU caches on every write, for power-fail durability on PMem without eADR. x86-64 only. |
 | `MOONCAKE_OFFSET_DAX_ZERO_COPY` | `false` | Serve remote reads straight out of the mapping over RDMA. |
 | `MOONCAKE_OFFSET_DAX_NUMA_NODE` | `-1` (auto) | NUMA node to register the arena under. Auto reads the device's `numa_node` from sysfs. |
+| `MOONCAKE_OFFSET_DAX_ZERO_COPY_PIN_LIMIT_BYTES` | `0` (arena size) | Cap on the bytes held by in-flight zero-copy reads. Reads over it are served by copy. |
 
 On the reading clients:
 - Keep the Transfer Engine on the RDMA NICs that reach the server (`MC_TE_FILTERS`).
